@@ -61,6 +61,9 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     df_feat["atr14"] = compute_atr(df, 14)
     df_feat["rsi14"] = compute_rsi(close, 14)
     df_feat["vol30"] = close.pct_change().rolling(30, min_periods=1).std().fillna(0)
+    df_feat["trend_strength"] = (df_feat["ma20"] - df_feat["ma60"]).abs() / (df_feat["atr14"] + 1e-8)
+    df_feat["trend_direction"] = np.sign(df_feat["ma20"] - df_feat["ma60"])
+    df_feat["chop_ratio"] = (df_feat["vol30"] / (df_feat["mom20"].abs() + 1e-8)).clip(0, 10)
 
     hours = df.index.hour
     minutes = df.index.minute
@@ -98,6 +101,10 @@ class SilverTrendRLEnv(gym.Env):
         early_close_minutes: int = 10,
         trade_penalty: float = 0.0,
         enable_time_filter: bool = True,
+        trend_filter_strength: float = 0.25,
+        max_chop_ratio: float = 2.5,
+        cooldown_bars: int = 2,
+        drawdown_penalty: float = 0.0,
     ):
         super().__init__()
 
@@ -116,6 +123,10 @@ class SilverTrendRLEnv(gym.Env):
         self.early_close_minutes = early_close_minutes
         self.trade_penalty = trade_penalty
         self.enable_time_filter = enable_time_filter
+        self.trend_filter_strength = trend_filter_strength
+        self.max_chop_ratio = max_chop_ratio
+        self.cooldown_bars = cooldown_bars
+        self.drawdown_penalty = drawdown_penalty
 
         self.obs_cols = list(self.df.columns)
         self.obs_mean = self.df[self.obs_cols].mean()
@@ -155,6 +166,8 @@ class SilverTrendRLEnv(gym.Env):
         self.trade_log = []
         self.equity_curve = []
         self.hold_bars = 0
+        self.cooldown_remaining = 0
+        self.peak_equity = float(self.initial_capital)
 
         obs = self._get_state()
         info = {}
@@ -195,6 +208,20 @@ class SilverTrendRLEnv(gym.Env):
            (h == 2 and m >= 30 - self.early_close_minutes):
             return True
         return False
+
+    def _can_open_new_position(self, direction: int):
+        row = self.df.iloc[self.t]
+        trend_strength = float(row["trend_strength"])
+        trend_direction = int(np.sign(row["trend_direction"]))
+        chop_ratio = float(row["chop_ratio"])
+
+        if trend_strength < self.trend_filter_strength:
+            return False
+        if chop_ratio > self.max_chop_ratio:
+            return False
+        if trend_direction != 0 and trend_direction != direction:
+            return False
+        return True
 
     # ============================================================
     # 加仓 / 减仓 / 平仓逻辑
@@ -295,9 +322,11 @@ class SilverTrendRLEnv(gym.Env):
         # 提前强制平仓
         if self.enable_time_filter and self._is_early_close_time(current_time):
             if self.position != 0 and self.hold_bars >= self.min_hold_bars:
+                close_size = self.entry_size
                 realized += self._close_all(current_price)
-                fee += self._calculate_fee(current_price, self.entry_size)
+                fee += self._calculate_fee(current_price, close_size)
                 trade_executed = True
+                self.cooldown_remaining = self.cooldown_bars
             # 禁止开仓
             if action in [1, 2, 5, 6]:
                 action = 0
@@ -313,27 +342,37 @@ class SilverTrendRLEnv(gym.Env):
 
             # 止损
             if unreal_points <= -stop_points:
+                close_size = self.entry_size
                 realized += self._close_all(current_price)
-                fee += self._calculate_fee(current_price, self.entry_size)
+                fee += self._calculate_fee(current_price, close_size)
                 trade_executed = True
+                self.cooldown_remaining = self.cooldown_bars
 
             # 止盈
             elif unreal_points >= tp_points:
+                close_size = self.entry_size
                 realized += self._close_all(current_price)
-                fee += self._calculate_fee(current_price, self.entry_size)
+                fee += self._calculate_fee(current_price, close_size)
                 trade_executed = True
+                self.cooldown_remaining = self.cooldown_bars
+
+        # 冷静期：禁止开新仓，避免高频反复打止损
+        if self.cooldown_remaining > 0 and action in [1, 2, 5, 6]:
+            action = 0
 
         # ============================================================
         # 动作执行（9 动作）
         # ============================================================
 
         if action == 1:  # 开多
-            r, f = self._open_position(1, current_price, size=1)
-            realized += r; fee += f; trade_executed = True
+            if self._can_open_new_position(1):
+                r, f = self._open_position(1, current_price, size=1)
+                realized += r; fee += f; trade_executed = True
 
         elif action == 2:  # 加多
-            r, f = self._open_position(1, current_price, size=1)
-            realized += r; fee += f; trade_executed = True
+            if self.position > 0:
+                r, f = self._open_position(1, current_price, size=1)
+                realized += r; fee += f; trade_executed = True
 
         elif action == 3:  # 减多
             if self.position > 0:
@@ -342,17 +381,21 @@ class SilverTrendRLEnv(gym.Env):
 
         elif action == 4:  # 平多
             if self.position > 0:
+                close_size = self.entry_size
                 r = self._close_all(current_price)
-                fee += self._calculate_fee(current_price, self.entry_size)
+                fee += self._calculate_fee(current_price, close_size)
                 realized += r; trade_executed = True
+                self.cooldown_remaining = self.cooldown_bars
 
         elif action == 5:  # 开空
-            r, f = self._open_position(-1, current_price, size=1)
-            realized += r; fee += f; trade_executed = True
+            if self._can_open_new_position(-1):
+                r, f = self._open_position(-1, current_price, size=1)
+                realized += r; fee += f; trade_executed = True
 
         elif action == 6:  # 加空
-            r, f = self._open_position(-1, current_price, size=1)
-            realized += r; fee += f; trade_executed = True
+            if self.position < 0:
+                r, f = self._open_position(-1, current_price, size=1)
+                realized += r; fee += f; trade_executed = True
 
         elif action == 7:  # 减空
             if self.position < 0:
@@ -361,9 +404,16 @@ class SilverTrendRLEnv(gym.Env):
 
         elif action == 8:  # 平空
             if self.position < 0:
+                close_size = self.entry_size
                 r = self._close_all(current_price)
-                fee += self._calculate_fee(current_price, self.entry_size)
+                fee += self._calculate_fee(current_price, close_size)
                 realized += r; trade_executed = True
+                self.cooldown_remaining = self.cooldown_bars
+
+        # 手续费真实计入现金
+        if fee > 0:
+            self.cash -= fee
+            self.total_fee += fee
 
         # ============================================================
         # 计算奖励（Δequity）
@@ -375,6 +425,10 @@ class SilverTrendRLEnv(gym.Env):
         reward = total_equity - self.last_equity
         if trade_executed:
             reward -= self.trade_penalty
+
+        self.peak_equity = max(self.peak_equity, total_equity)
+        current_drawdown = (self.peak_equity - total_equity) / max(1e-6, self.peak_equity)
+        reward -= self.drawdown_penalty * current_drawdown
 
         # 记录 equity
         self.equity_curve.append({
@@ -407,6 +461,8 @@ class SilverTrendRLEnv(gym.Env):
         self.last_equity = total_equity
         self.last_price = current_price
         self.t += 1
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
 
         terminated = (self.t >= len(self.df) - 1)
         truncated = False
