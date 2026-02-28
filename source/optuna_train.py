@@ -97,6 +97,10 @@ def make_env_fn(df, params):
             early_close_minutes=10,
             trade_penalty=params["trade_penalty"],
             enable_time_filter=True,
+            trend_filter_strength=params["trend_filter_strength"],
+            max_chop_ratio=params["max_chop_ratio"],
+            cooldown_bars=params["cooldown_bars"],
+            drawdown_penalty=params["drawdown_penalty"],
         )
     return _init
 
@@ -118,6 +122,10 @@ def run_backtest_from_model(model, df, params):
         early_close_minutes=10,
         trade_penalty=params["trade_penalty"],
         enable_time_filter=True,
+        trend_filter_strength=params["trend_filter_strength"],
+        max_chop_ratio=params["max_chop_ratio"],
+        cooldown_bars=params["cooldown_bars"],
+        drawdown_penalty=params["drawdown_penalty"],
     )
 
     obs, info = env.reset()
@@ -143,6 +151,10 @@ def objective(trial: optuna.Trial):
         "atr_tp_multiplier": trial.suggest_float("atr_tp_multiplier", 2.0, 6.0),
         "min_hold_bars": trial.suggest_int("min_hold_bars", 1, 30),
         "trade_penalty": trial.suggest_float("trade_penalty", 0.0, 1.0),
+        "trend_filter_strength": trial.suggest_float("trend_filter_strength", 0.05, 1.0),
+        "max_chop_ratio": trial.suggest_float("max_chop_ratio", 1.0, 5.0),
+        "cooldown_bars": trial.suggest_int("cooldown_bars", 0, 8),
+        "drawdown_penalty": trial.suggest_float("drawdown_penalty", 0.0, 5.0),
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True),
         "ent_coef": trial.suggest_float("ent_coef", 1e-6, 0.01, log=True),
         "gamma": trial.suggest_float("gamma", 0.98, 0.999),
